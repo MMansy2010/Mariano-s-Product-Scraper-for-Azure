@@ -1,0 +1,59 @@
+
+{
+  "retailer": "Mariano's",
+  "locations": [
+    {
+      "id": "lakeshore-east",
+      "zipcode": "60601",
+      "store_name": "Mariano's Lakeshore East",
+      "store_location": "333 E Benton Pl, Chicago, IL 60601",
+      "store_id": "53100503"
+    },
+    {
+      "id": "bucktown",
+      "zipcode": "",
+      "store_name": "Mariano's Bucktown",
+      "store_location": "",
+      "store_id": "53100516"
+    },
+    {
+      "id": "new-city",
+      "zipcode": "",
+      "store_name": "Mariano's New City",
+      "store_location": "",
+      "store_id": "53100534"
+    }
+  ],
+  "schedule_timezone": "America/Chicago",
+  "max_retries": 3,
+  "request_timeout_ms": 45000,
+  "navigation_delay_seconds": 2.0,
+  "min_records_for_publish": 500,
+  "min_categories_with_products": 3,
+  "minimum_yield_ratio_vs_last_success": 0.55,
+  "required_fields": [
+    "zipcode",
+    "store_name",
+    "store_location",
+    "store_logo",
+    "store_brand",
+    "category",
+    "sub_category",
+    "product_title",
+    "weight",
+    "regular_price",
+    "sale_price",
+    "volume_deals_description",
+    "volume_deals_price",
+    "digital_deals_description",
+    "digital_deals_price",
+    "image_url",
+    "url",
+    "upc",
+    "gupc",
+    "ppm",
+    "unit_price",
+    "crawl_date"
+  ],
+  "user_agent": "Mozilla/5.0 (compatible; AuthorizedCatalogAudit/1.0; +contact-configured-by-operator)"
+}
