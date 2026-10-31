@@ -61,8 +61,10 @@ def numeric_price(value: Any) -> str:
         return ""
 
 
-def is_approx_weight(weight: str) -> bool:
-    return bool(APPROX_RE.search(weight or ""))
+def is_approx_weight(weight: str, *product_text: str) -> bool:
+    """Detect approximate-weight wording wherever the retailer places it."""
+    combined = " ".join([clean_text(weight), *(clean_text(v) for v in product_text)])
+    return bool(APPROX_RE.search(combined))
 
 
 def classify_deals(text: str) -> tuple[str, str]:
@@ -83,10 +85,14 @@ def is_private_label(title: str) -> str:
 
 
 def product_key(record: dict[str, str]) -> str:
+    """Store-scoped product identity; the same UPC at different stores is valid."""
     upc = record.get("upc", "").strip()
     url = record.get("url", "").strip()
     title = record.get("product_title", "").strip().casefold()
-    return f"upc:{upc}" if upc else (f"url:{url}" if url else f"title:{title}")
+    store = "|".join(clean_text(record.get(k, "")).casefold() for k in
+                     ("zipcode", "store_name", "store_location"))
+    identity = f"upc:{upc}" if upc else (f"url:{url}" if url else f"title:{title}")
+    return f"store:{store}|{identity}"
 
 
 
@@ -114,7 +120,7 @@ def validate_records(records: list[dict[str, str]], category_stats: list[dict[st
     required_nonempty = ["category", "product_title", "url", "crawl_date"]
     invalid_required = sum(1 for r in records if any(not r.get(k, "").strip() for k in required_nonempty))
     bad_gupc_or_unit = sum(1 for r in records if r.get("gupc") != "" or r.get("unit_price") != "")
-    bad_approx = sum(1 for r in records if is_approx_weight(r.get("weight", "")))
+    bad_approx = sum(1 for r in records if is_approx_weight(r.get("weight", ""), r.get("product_title", "")))
     minimum = int(cfg.get("min_records_for_publish", 500))
     min_categories = int(cfg.get("min_categories_with_products", 3))
     categories_with_products = sum(1 for _, count in counts.items() if count > 0)
