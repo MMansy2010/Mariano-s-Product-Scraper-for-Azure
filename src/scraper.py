@@ -31,12 +31,121 @@ CHECKPOINT_DIR = DATA_DIR / "checkpoints"
 
 
 def replace_category_records(existing_records, category_name, new_records):
-    """Replace one category while preserving records from other categories."""
-    preserved = [
+    """Merge a recrawled category without deleting historically observed products.
+
+    Fresh observations replace older versions of the same store-scoped product.
+    Products absent from the new crawl remain with their original crawl_date.
+    Approximate-weight products are excluded from both sources.
+    """
+    preserved_other_categories = [
         record for record in existing_records
         if record.get("category") != category_name
     ]
-    return preserved + new_records
+
+    previous_category = [
+        record for record in existing_records
+        if record.get("category") == category_name
+        and not is_approx_weight(
+            record.get("weight", ""),
+            record.get("product_title", ""),
+        )
+    ]
+
+    fresh_category = [
+        record for record in new_records
+        if not is_approx_weight(
+            record.get("weight", ""),
+            record.get("product_title", ""),
+        )
+    ]
+
+    merged = {}
+
+    # Keep historical records first. Their original crawl_date is preserved.
+    for record in previous_category:
+        merged.setdefault(product_key(record), record)
+
+    # Fresh observations take precedence for matching store-scoped identities.
+    for record in fresh_category:
+        merged[product_key(record)] = record
+
+    return preserved_other_categories + list(merged.values())
+
+
+def location_record_matches(record, location):
+    """Match a catalog record to a configured store using the schema's store fields."""
+    pairs = (
+        ("zipcode", "zipcode"),
+        ("store_name", "store_name"),
+        ("store_location", "store_location"),
+    )
+    expected = [
+        (clean_text(record.get(record_key)), clean_text(location.get(config_key)))
+        for record_key, config_key in pairs
+    ]
+    return all(left and right and left.casefold() == right.casefold()
+               for left, right in expected)
+
+
+def load_previous_catalog(path):
+    """Load a previously published catalog or fail closed if its structure is unsafe."""
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Previous catalog is unreadable; refusing to start: {type(exc).__name__}"
+        ) from exc
+
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("Previous catalog must be a non-empty JSON list; refusing to start.")
+
+    retained = []
+    required = (
+        "zipcode", "store_name", "store_location", "category",
+        "product_title", "url", "crawl_date",
+    )
+
+    for index, record in enumerate(data):
+        if not isinstance(record, dict) or list(record.keys()) != FIELDS:
+            raise RuntimeError(
+                f"Previous catalog record {index} does not match the exact 22-field schema."
+            )
+        if any(not isinstance(value, str) for value in record.values()):
+            raise RuntimeError(
+                f"Previous catalog record {index} contains a non-string value."
+            )
+        if any(not record.get(field, "").strip() for field in required):
+            raise RuntimeError(
+                f"Previous catalog record {index} is missing a required value."
+            )
+        if record["gupc"] != "" or record["unit_price"] != "":
+            raise RuntimeError(
+                f"Previous catalog record {index} violates the blank gupc/unit_price rule."
+            )
+
+        # Approximate-weight products are excluded, not retained as historical products.
+        if not is_approx_weight(record["weight"], record["product_title"]):
+            retained.append(record)
+
+    keys = [product_key(record) for record in retained]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("Previous catalog contains duplicate store-scoped product identities.")
+
+    LOG.info(
+        "previous_catalog_loaded records=%d approximate_weight_excluded=%d",
+        len(retained), len(data) - len(retained),
+    )
+    return retained
+
+
+def apply_category_result(existing_records, category_name, new_records, status):
+    """Only a fully successful category crawl may replace historical observations."""
+    if status != "ok":
+        return list(existing_records)
+    return replace_category_records(existing_records, category_name, new_records)
 
 
 def publish_staging_file(staging_path, final_path):
@@ -157,6 +266,35 @@ def is_checkpoint_compatible(
         for record in saved["records_so_far"]
     ):
         return False
+
+    expected_fields = ("zipcode", "store_name", "store_location",
+                       "category", "product_title", "url", "crawl_date")
+    for record in saved["records_so_far"]:
+        if not all(isinstance(value, str) for value in record.values()):
+            return False
+        if any(not record.get(field, "").strip() for field in expected_fields):
+            return False
+        if record.get("gupc") != "" or record.get("unit_price") != "":
+            return False
+        if is_approx_weight(record.get("weight", ""), record.get("product_title", "")):
+            return False
+        if not location_record_matches(record, location):
+            return False
+
+    keys = [product_key(record) for record in saved["records_so_far"]]
+    if len(keys) != len(set(keys)):
+        return False
+
+    seen_categories = set()
+    for item in saved["completed_categories"]:
+        category = item.get("category")
+        if not isinstance(category, str) or not category.strip():
+            return False
+        if category in seen_categories:
+            return False
+        seen_categories.add(category)
+        if item.get("status") not in ("ok", "incomplete", "failed"):
+            return False
 
     return True
 
@@ -707,10 +845,17 @@ async def run(args) -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     final_path = DATA_DIR / "marianos_latest.json"
+    previous_records = load_previous_catalog(final_path)
     run_stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     staging_path = DATA_DIR / f"staging_{run_stamp}.json"
     report_path = DATA_DIR / f"report_{run_stamp}.json"
-    all_records: list[dict[str, str]] = []
+
+    # Keep stores not selected for this run untouched in the eventual publication.
+    all_records: list[dict[str, str]] = [
+        record for record in previous_records
+        if not any(location_record_matches(record, location)
+                   for location in selected_locations)
+    ]
     all_stats: list[dict[str, Any]] = []
     location_proofs = []
     async with async_playwright() as p:
@@ -751,7 +896,11 @@ async def run(args) -> int:
                 loc_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(location.get("id") or "location"))
                 checkpoint_path = CHECKPOINT_DIR / f"checkpoint_{loc_key}.json"
                 current_fingerprint = checkpoint_fingerprint(location, categories)
-                location_records: list[dict[str, str]] = []
+                historical_location_records = [
+                    record for record in previous_records
+                    if location_record_matches(record, location)
+                ]
+                location_records: list[dict[str, str]] = list(historical_location_records)
                 location_stats: list[dict[str, Any]] = []
                 completed_names: set[str] = set()
                 
@@ -764,15 +913,31 @@ async def run(args) -> int:
                         if is_checkpoint_compatible(
                             saved, location, current_fingerprint
                         ):
-                            location_records = saved["records_so_far"]
-                            location_stats = saved["completed_categories"]
+                            saved_records = saved.get("records_so_far")
+                            saved_stats = saved.get("completed_categories")
+                            if not isinstance(saved_records, list) or not isinstance(saved_stats, list):
+                                raise ValueError("checkpoint_records_or_stats_invalid")
 
-                            completed_names = {
-                                s["category"]
-                                for s in location_stats
-                                if s.get("status") == "ok"
-                                and isinstance(s.get("category"), str)
-                            }
+                            location_stats = saved_stats
+                            completed_names = set()
+
+                            # Merge only categories explicitly marked successful.
+                            # Partial records from failed categories are never trusted.
+                            for saved_stat in location_stats:
+                                saved_category = saved_stat.get("category")
+                                if saved_stat.get("status") != "ok" or not isinstance(saved_category, str):
+                                    continue
+                                saved_category_rows = [
+                                    record for record in saved_records
+                                    if isinstance(record, dict)
+                                    and record.get("category") == saved_category
+                                ]
+                                if not saved_category_rows:
+                                    continue
+                                location_records = replace_category_records(
+                                    location_records, saved_category, saved_category_rows
+                                )
+                                completed_names.add(saved_category)
 
                             LOG.info(
                                 "resume_loaded location=%s completed_categories=%d records=%d",
@@ -786,7 +951,7 @@ async def run(args) -> int:
                             if expected_names and expected_names.issubset(completed_names):
                                 LOG.warning("resume_rejected_completed_checkpoint location=%s; starting fresh",
                                             location.get("id"))
-                                location_records = []
+                                location_records = list(historical_location_records)
                                 location_stats = []
                                 completed_names = set()
                         else:
@@ -796,6 +961,11 @@ async def run(args) -> int:
                             )
 
                     except Exception as e:
+                        # Discard every partial checkpoint merge. Never retain
+                        # records from a checkpoint that failed validation.
+                        location_records = list(historical_location_records)
+                        location_stats = []
+                        completed_names = set()
                         LOG.warning(
                             "checkpoint_unreadable location=%s error=%s; starting fresh",
                             location.get("id"),
@@ -814,10 +984,10 @@ async def run(args) -> int:
                     ]
                     location_stats.append(stats)
 
-                    # Replace this category's previous partial records on resume.
-                    # Keep records belonging to other successful categories.
-                    location_records = replace_category_records(
-                        location_records, category["category"], rows
+                    # Only a complete category crawl may update the catalog.
+                    # Incomplete results remain in diagnostics/checkpoints, not publication.
+                    location_records = apply_category_result(
+                        location_records, category["category"], rows, stats.get("status")
                     )
                     # Keep the checkpoint for failed categories too, but only successful categories are skipped.
                     checkpoint = {
@@ -850,17 +1020,11 @@ async def run(args) -> int:
     for rec in all_records:
         base_key = product_key(rec)
 
-        if base_key in ("title:", "url:"):
+        if not rec.get("upc", "").strip() and not rec.get("url", "").strip():
             continue
 
-        location_key = (
-            rec.get("zipcode", ""),
-            rec.get("store_name", ""),
-            rec.get("store_location", ""),
-        )
-
-        key = (*location_key, base_key)
-        unique.setdefault(key, rec)
+        # product_key already includes zipcode, store name, and store address.
+        unique.setdefault(base_key, rec)
 
     records = list(unique.values())
 
