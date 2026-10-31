@@ -30,6 +30,26 @@ LOG_DIR = ROOT / "logs"
 CHECKPOINT_DIR = DATA_DIR / "checkpoints"
 
 
+def replace_category_records(existing_records, category_name, new_records):
+    """Replace one category while preserving records from other categories."""
+    preserved = [
+        record for record in existing_records
+        if record.get("category") != category_name
+    ]
+    return preserved + new_records
+
+
+def publish_staging_file(staging_path, final_path):
+    """Atomically publish a completed file while preserving the previous output."""
+    publish_temp = final_path.with_name(final_path.name + ".tmp")
+    try:
+        shutil.copy2(staging_path, publish_temp)
+        publish_temp.replace(final_path)
+    finally:
+        if publish_temp.exists():
+            publish_temp.unlink()
+
+
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -346,35 +366,41 @@ async def discover_next_page_url(page) -> str:
 
 
 async def parse_product_page(browser, url: str, meta: dict[str, str], location: dict[str, Any],
-                             crawl_date: str, timeout_ms: int) -> dict[str, str] | None:
+                             crawl_date: str, timeout_ms: int) -> dict[str, Any]:
     page = await browser.new_page()
     try:
         response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
         if response and response.status >= 400:
+            reason = f"http_{response.status}"
             LOG.warning("product_http_error status=%s url=%s", response.status, url)
-            return None
+            return {"status": "parse_failed", "record": None, "reason": reason, "title": ""}
+
         await page.wait_for_timeout(500)
         products = await extract_jsonld(page)
         p = products[0] if products else {}
         title = clean_text(p.get("name"))
+
         if not title:
             try:
                 title = clean_text(await page.locator("h1").first.inner_text(timeout=2000))
             except Exception:
                 title = ""
+
         if not title:
-            return None
-        visible = await visible_product_facts(page)
-        offers = p.get("offers", {})
-        if isinstance(offers, list):
-            offers = offers[0] if offers else {}
-        if not isinstance(offers, dict):
-            offers = {}
-        raw_price = clean_text(offers.get("price"))
+            return {
+                "status": "parse_failed", "record": None,
+                "reason": "missing_product_title", "title": ""
+            }
+
         raw_weight = clean_text(p.get("weight") or p.get("size"))
         if is_approx_weight(raw_weight, title):
-            LOG.info("excluded_approx_weight title=%s", title)
-            return None
+            LOG.info("excluded_approx_weight title=%s url=%s", title, url)
+            return {
+                "status": "excluded_approx_weight", "record": None,
+                "reason": "approximate_weight", "title": title
+            }
+
+        visible = await visible_product_facts(page)
         rec = blank_record()
         rec.update({
             "zipcode": clean_text(location.get("zipcode")),
@@ -400,17 +426,24 @@ async def parse_product_page(browser, url: str, meta: dict[str, str], location: 
             "unit_price": "",
             "crawl_date": crawl_date,
         })
-        # Some JSON-LD image fields are arrays; preserve first retailer URL if supplied that way.
+
         if isinstance(p.get("image"), list):
             rec["image_url"] = clean_text(p["image"][0]) if p["image"] else ""
-        # Schema.org fields are only a fallback; no deal or PPM values are inferred.
-        return rec
+
+        return {"status": "success", "record": rec, "reason": "", "title": title}
+
     except PlaywrightTimeoutError:
         LOG.warning("product_timeout url=%s", url)
-        return None
+        return {
+            "status": "parse_failed", "record": None,
+            "reason": "timeout", "title": ""
+        }
     except Exception as e:
         LOG.warning("product_parse_error url=%s error=%s", url, type(e).__name__)
-        return None
+        return {
+            "status": "parse_failed", "record": None,
+            "reason": type(e).__name__, "title": ""
+        }
     finally:
         await page.close()
 
@@ -488,6 +521,7 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             pagination_stop_reason = "no_next_page"
             while page_url:
                 if page_url in page_urls_seen:
+                    pagination_complete = False
                     pagination_stop_reason = "repeated_page_detected"
                     break
                 page_urls_seen.add(page_url)
@@ -499,7 +533,15 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                         pagination_stop_reason = f"http_{next_response.status}"
                         break
                     await next_page.wait_for_timeout(500)
-                    await maybe_load_more(next_page)
+                    next_scroll = await maybe_load_more(next_page)
+                    if not next_scroll.get("complete"):
+                        pagination_complete = False
+                        pagination_stop_reason = "incomplete_infinite_scroll_on_next_page"
+                        LOG.error(
+                            "next_page_infinite_scroll_incomplete category=%s url=%s details=%r",
+                            name, page_url, next_scroll
+                        )
+                        break
                     product_links.extend(await discover_product_links(next_page))
                     page_url = await discover_next_page_url(next_page)
                 except Exception as exc:
@@ -512,6 +554,8 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             # price/deal/PPM context. Use category JSON-LD only as a fallback when no product links exist.
             category_jsonld = [] if (product_links or subcategory_product_links) else await extract_jsonld(page)
             records = []
+            excluded_approx_weight = []
+            product_parse_failures = []
             for p in category_jsonld:
                 title = clean_text(p.get("name"))
                 if not title:
@@ -522,7 +566,13 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                 if not isinstance(offers, dict):
                     offers = {}
                 weight = clean_text(p.get("weight") or p.get("size"))
-                if is_approx_weight(weight):
+                if is_approx_weight(weight, title):
+                    excluded_approx_weight.append({
+                        "url": clean_text(p.get("url")),
+                        "title": title,
+                        "reason": "approximate_weight",
+                        "source": "category_jsonld",
+                    })
                     continue
                 rec = blank_record()
                 rec.update({
@@ -544,27 +594,46 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             # Generic fallback: visit discovered product links and parse JSON-LD. Not guaranteed to
             # discover all pagination/subcategories; validation must fail closed if coverage is thin.
             seen_product_urls: set[str] = set()
-            product_parse_failures = []
             for product_url in product_links:
                 if product_url in seen_product_urls:
                     continue
                 seen_product_urls.add(product_url)
-                rec = await parse_product_page(browser, product_url, category, location, crawl_date, timeout_ms)
-                if rec:
-                    records.append(rec)
+                result = await parse_product_page(browser, product_url, category, location, crawl_date, timeout_ms)
+                if result["status"] == "success":
+                    records.append(result["record"])
+                elif result["status"] == "excluded_approx_weight":
+                    excluded_approx_weight.append({
+                        "url": product_url,
+                        "title": result["title"],
+                        "reason": result["reason"],
+                        "source": "product_page",
+                    })
                 else:
-                    product_parse_failures.append(product_url)
+                    product_parse_failures.append({
+                        "url": product_url,
+                        "reason": result["reason"],
+                    })
                 await asyncio.sleep(delay / 2)
             for product_url, sub_category in subcategory_product_links:
                 if product_url in seen_product_urls:
                     continue
                 seen_product_urls.add(product_url)
                 sub_meta = {**category, "sub_category": sub_category}
-                rec = await parse_product_page(browser, product_url, sub_meta, location, crawl_date, timeout_ms)
-                if rec:
-                    records.append(rec)
+                result = await parse_product_page(browser, product_url, sub_meta, location, crawl_date, timeout_ms)
+                if result["status"] == "success":
+                    records.append(result["record"])
+                elif result["status"] == "excluded_approx_weight":
+                    excluded_approx_weight.append({
+                        "url": product_url,
+                        "title": result["title"],
+                        "reason": result["reason"],
+                        "source": "subcategory_product_page",
+                    })
                 else:
-                    product_parse_failures.append(product_url)
+                    product_parse_failures.append({
+                        "url": product_url,
+                        "reason": result["reason"],
+                    })
                 await asyncio.sleep(delay / 2)
             await page.close()
             # Remove duplicates within this category.
@@ -580,7 +649,10 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                 "records": len(rows), "discovered_product_links": len(seen_product_urls),
                 "discovered_subcategories": len(subcategories), "pagination_pages_visited": len(page_urls_seen),
                 "pagination_complete": pagination_complete, "pagination_stop_reason": pagination_stop_reason,
-                "product_parse_failures": product_parse_failures, "subcategory_failures": subcategory_failures,
+                "product_parse_failures": product_parse_failures,
+                "excluded_approx_weight": excluded_approx_weight,
+                "excluded_approx_weight_count": len(excluded_approx_weight),
+                "subcategory_failures": subcategory_failures,
                 "scroll_result": scroll_result,
                 "store_evidence": evidence,
                 "error": "" if rows and pagination_complete and not product_parse_failures and not subcategory_failures else
@@ -599,7 +671,24 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             if not page.is_closed():
                 await page.close()
         await asyncio.sleep(delay * attempt)
-    return [], {"category": name, "url": url, "status": "failed", "records": 0, "error": last_error}
+    return [], {
+        "category": name,
+        "url": url,
+        "status": "failed",
+        "records": 0,
+        "discovered_product_links": 0,
+        "discovered_subcategories": 0,
+        "pagination_pages_visited": 0,
+        "pagination_complete": False,
+        "pagination_stop_reason": "category_attempts_exhausted",
+        "product_parse_failures": [],
+        "excluded_approx_weight": [],
+        "excluded_approx_weight_count": 0,
+        "subcategory_failures": [],
+        "scroll_result": {},
+        "store_evidence": {},
+        "error": last_error,
+    }
 
 
 
@@ -719,9 +808,17 @@ async def run(args) -> int:
                         continue
                     rows, stats = await crawl_category(context, category, location, cfg, crawl_date)
                     stats["location_id"] = location.get("id", "")
-                    location_stats = [s for s in location_stats if s.get("category") != category["category"]]
+                    location_stats = [
+                        s for s in location_stats
+                        if s.get("category") != category["category"]
+                    ]
                     location_stats.append(stats)
-                    location_records.extend(rows)
+
+                    # Replace this category's previous partial records on resume.
+                    # Keep records belonging to other successful categories.
+                    location_records = replace_category_records(
+                        location_records, category["category"], rows
+                    )
                     # Keep the checkpoint for failed categories too, but only successful categories are skipped.
                     checkpoint = {
     "run_id": run_stamp,
@@ -780,7 +877,7 @@ async def run(args) -> int:
              checks["total_records"], checks["unique_products"], checks["duplicate_count"],
              checks["validation_passed"])
     if checks["validation_passed"]:
-        shutil.copy2(staging_path, final_path)
+        publish_staging_file(staging_path, final_path)
         LOG.info("published path=%s", final_path)
         return 0
     LOG.error("run_rejected; previous successful output preserved; report=%s", report_path)
