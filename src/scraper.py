@@ -245,7 +245,7 @@ PPM_RE = re.compile(r"\$\s*\d+(?:\.\d{1,4})?\s*/\s*(?:fl\s*oz|oz|lb|ct|qt|gal|ea
 
 
 async def visible_product_facts(page) -> dict[str, str]:
-    """Extract only values visibly present in page text/standard metadata; no price calculations."""
+    """Extract conservative product-page facts; never promote savings text into a price."""
     facts = {"ppm": "", "volume_description": "", "digital_description": "",
              "volume_price": "", "digital_price": "", "regular_price": "", "sale_price": ""}
     try:
@@ -254,55 +254,54 @@ async def visible_product_facts(page) -> dict[str, str]:
         body = ""
     lines = [clean_text(line) for line in body.splitlines() if clean_text(line)]
     for line in lines:
-        ppm_match = PPM_RE.search(line)
-        if ppm_match and not facts["ppm"]:
-            # Preserve the retailer's displayed token as closely as possible.
-            facts["ppm"] = ppm_match.group(0)
         volume, digital = classify_deals(line)
         if digital and not facts["digital_description"]:
             facts["digital_description"] = digital
-            explicit = re.search(r"\$\s*\d+(?:\.\d{1,2})?\s*(?:each|ea\.?|with digital coupon)", line, re.I)
-            if explicit:
-                price_match = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)", explicit.group(0))
-                if price_match:
-                    facts["digital_price"] = price_match.group(1)
+            # Accept only a price explicitly stated as the price with the digital coupon.
+            match = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)\s*(?:with|w/)\s*(?:the\s*)?digital coupon", line, re.I)
+            if match:
+                facts["digital_price"] = match.group(1)
         elif volume and not facts["volume_description"]:
             facts["volume_description"] = volume
-            # Only accept an explicitly stated deal amount; never derive from quantity.
+            # Retain only an explicit offer amount, never calculate a per-item price.
             amount = re.search(r"\b\d+\s*for\s*\$\s*(\d+(?:\.\d{1,2})?)\b", line, re.I)
             if not amount:
                 amount = re.search(r"\$\s*(\d+(?:\.\d{1,2})?)\s*(?:each|ea\.?)", line, re.I)
             if amount:
                 facts["volume_price"] = amount.group(1)
-    # Standardized current price only if a product-specific price element exists.
-    selectors = [
-        '[data-testid="product-price"]', '[data-testid*="price"]',
-        '[class*="ProductPrice"]', '[class*="product-price"]'
-    ]
-    for selector in selectors:
+
+    # Use a current product price only when the page exposes a product-price element.
+    current_price = ""
+    for selector in ['[data-testid="product-price"]', '[data-testid*="price"]',
+                     '[class*="ProductPrice"]', '[class*="product-price"]']:
         try:
             locator = page.locator(selector).first
             if await locator.count():
-                text = clean_text(await locator.inner_text(timeout=1000))
-                value = numeric_price(text)
-                if value:
-                    facts["sale_price"] = value
+                current_price = numeric_price(await locator.inner_text(timeout=1000))
+                if current_price:
                     break
         except Exception:
             continue
-    # Do not label a price regular/sale unless the DOM explicitly marks a crossed-out original price.
+
+    original_price = ""
     for selector in ['del', 's', '[class*="strikethrough"]', '[class*="original-price"]']:
         try:
             locator = page.locator(selector).first
             if await locator.count():
-                value = numeric_price(await locator.inner_text(timeout=800))
-                if value:
-                    facts["regular_price"] = value
+                original_price = numeric_price(await locator.inner_text(timeout=800))
+                if original_price:
                     break
         except Exception:
             continue
-    return facts
 
+    if current_price and original_price:
+        facts["regular_price"] = original_price
+        facts["sale_price"] = current_price
+    elif current_price:
+        facts["regular_price"] = current_price
+
+    # PPM is deliberately blank until a product-specific, structurally bound source is verified.
+    return facts
 
 async def discover_subcategory_links(page, parent_url: str) -> list[dict[str, str]]:
     """Discover visible /pl/ category links from a department page."""
@@ -373,7 +372,7 @@ async def parse_product_page(browser, url: str, meta: dict[str, str], location: 
             offers = {}
         raw_price = clean_text(offers.get("price"))
         raw_weight = clean_text(p.get("weight") or p.get("size"))
-        if is_approx_weight(raw_weight):
+        if is_approx_weight(raw_weight, title):
             LOG.info("excluded_approx_weight title=%s", title)
             return None
         rec = blank_record()
@@ -387,7 +386,7 @@ async def parse_product_page(browser, url: str, meta: dict[str, str], location: 
             "sub_category": meta.get("sub_category", ""),
             "product_title": title,
             "weight": raw_weight,
-            "regular_price": visible["regular_price"] or (numeric_price(raw_price) if not visible["sale_price"] else ""),
+            "regular_price": visible["regular_price"],
             "sale_price": visible["sale_price"],
             "volume_deals_description": visible["volume_description"],
             "volume_deals_price": visible["volume_price"],
