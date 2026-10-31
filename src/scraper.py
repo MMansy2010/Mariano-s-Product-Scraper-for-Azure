@@ -451,24 +451,35 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                 LOG.error("possible_block category=%s url=%s", name, page.url)
                 await page.close()
                 break
-            await maybe_load_more(page)
+            scroll_result = await maybe_load_more(page)
+            if not scroll_result.get("complete"):
+                last_error = "incomplete_infinite_scroll"
+                LOG.error("infinite_scroll_incomplete category=%s details=%r", name, scroll_result)
+                await page.close()
+                break
             product_links = await discover_product_links(page)
             # Follow retailer-linked subcategory pages; keep only links actually exposed by the page.
             subcategories = await discover_subcategory_links(page, url)
             subcategory_product_links: list[tuple[str, str]] = []
+            subcategory_failures: list[dict[str, str]] = []
             for sub in subcategories:
                 sub_page = await browser.new_page()
                 try:
                     sub_response = await sub_page.goto(sub["url"], wait_until="domcontentloaded", timeout=timeout_ms)
                     if sub_response and sub_response.status >= 400:
                         LOG.warning("subcategory_http_error category=%s subcategory=%s status=%s", name, sub["sub_category"], sub_response.status)
+                        subcategory_failures.append({"subcategory": sub["sub_category"], "error": f"http_{sub_response.status}"})
                         continue
                     await sub_page.wait_for_timeout(700)
-                    await maybe_load_more(sub_page)
+                    sub_scroll = await maybe_load_more(sub_page)
+                    if not sub_scroll.get("complete"):
+                        subcategory_failures.append({"subcategory": sub["sub_category"], "error": "incomplete_infinite_scroll"})
+                        continue
                     for product_url in await discover_product_links(sub_page):
                         subcategory_product_links.append((product_url, sub["sub_category"]))
                 except Exception as e:
                     LOG.warning("subcategory_error category=%s subcategory=%s error=%s", name, sub["sub_category"], type(e).__name__)
+                    subcategory_failures.append({"subcategory": sub["sub_category"], "error": type(e).__name__})
                 finally:
                     await sub_page.close()
             # Also follow retailer-provided pagination links, never invent page numbers.
@@ -566,13 +577,14 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             rows = list(unique.values())
             stats = {
                 "category": name, "url": url, "attempt": attempt,
-                "status": "ok" if rows and pagination_complete and not product_parse_failures else "incomplete",
+                "status": "ok" if rows and pagination_complete and not product_parse_failures and not subcategory_failures else "incomplete",
                 "records": len(rows), "discovered_product_links": len(seen_product_urls),
                 "discovered_subcategories": len(subcategories), "pagination_pages_visited": len(page_urls_seen),
                 "pagination_complete": pagination_complete, "pagination_stop_reason": pagination_stop_reason,
-                "product_parse_failures": product_parse_failures,
+                "product_parse_failures": product_parse_failures, "subcategory_failures": subcategory_failures,
+                "scroll_result": scroll_result,
                 "store_evidence": evidence,
-                "error": "" if rows and pagination_complete and not product_parse_failures else
+                "error": "" if rows and pagination_complete and not product_parse_failures and not subcategory_failures else
                          "incomplete_collection_or_product_parse_failure"
             }
             LOG.info("category_finish location=%s category=%s records=%d links=%d status=%s",
@@ -680,6 +692,15 @@ async def run(args) -> int:
                                 len(completed_names),
                                 len(location_records),
                             )
+
+                            # A fully completed checkpoint is not a resumable interrupted run.
+                            expected_names = {item["category"] for item in categories}
+                            if expected_names and expected_names.issubset(completed_names):
+                                LOG.warning("resume_rejected_completed_checkpoint location=%s; starting fresh",
+                                            location.get("id"))
+                                location_records = []
+                                location_stats = []
+                                completed_names = set()
                         else:
                             LOG.warning(
                                 "checkpoint_invalid_or_mismatched location=%s; starting fresh",
