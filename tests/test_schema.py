@@ -23,11 +23,23 @@ def test_approx_weight():
     assert not is_approx_weight("16 oz")
 
 
-def test_product_key_prefers_upc():
-    r = blank_record()
-    r["upc"] = "012345678905"
-    r["url"] = "https://example.com/p/test"
-    assert product_key(r) == "upc:012345678905"
+def test_product_key_is_store_scoped_and_prefers_upc():
+    r1 = blank_record()
+    r1["upc"] = "012345678905"
+    r1["url"] = "https://example.com/p/test"
+    r1["zipcode"] = "60061"
+    r1["store_name"] = "Marianos Vernon Hills"
+    r1["store_location"] = "1720 N Milwaukee Ave"
+
+    r2 = dict(r1)
+    r2["store_name"] = "Marianos Chicago"
+
+    key1 = product_key(r1)
+    key2 = product_key(r2)
+
+    assert "upc:012345678905" in key1
+    assert "upc:012345678905" in key2
+    assert key1 != key2
 
 
 def test_deal_classification_separates_digital_and_volume():
