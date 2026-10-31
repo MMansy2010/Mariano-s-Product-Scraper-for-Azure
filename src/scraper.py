@@ -216,24 +216,29 @@ async def discover_product_links(page) -> list[str]:
     return result
 
 
-async def maybe_load_more(page) -> None:
-    # Conservative generic support; stop when page no longer grows.
+async def maybe_load_more(page) -> dict[str, Any]:
+    """Scroll until the product-link count is stable; no arbitrary iteration cap."""
     prior = -1
     stable = 0
-    for _ in range(18):
+    iterations = 0
+    while stable < 3:
         try:
             count = await page.locator('a[href*="/p/"], a[href*="/product/"]').count()
-        except Exception:
-            break
+        except Exception as exc:
+            return {"complete": False, "reason": f"link_count_error:{type(exc).__name__}",
+                    "iterations": iterations, "links": max(prior, 0)}
         if count == prior:
             stable += 1
         else:
             stable = 0
-        if stable >= 2:
+        if stable >= 3:
             break
         prior = count
+        iterations += 1
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         await page.wait_for_timeout(700)
+    return {"complete": True, "reason": "stable_product_link_count",
+            "iterations": iterations, "links": max(prior, 0)}
 
 
 PPM_RE = re.compile(r"\$\s*\d+(?:\.\d{1,4})?\s*/\s*(?:fl\s*oz|oz|lb|ct|qt|gal|ea|each|100\s*g|100\s*ml)", re.I)
@@ -469,19 +474,28 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             # Also follow retailer-provided pagination links, never invent page numbers.
             page_url = await discover_next_page_url(page)
             page_urls_seen = {url}
-            for _ in range(20):
-                if not page_url or page_url in page_urls_seen:
+            pagination_complete = True
+            pagination_stop_reason = "no_next_page"
+            while page_url:
+                if page_url in page_urls_seen:
+                    pagination_stop_reason = "repeated_page_detected"
                     break
                 page_urls_seen.add(page_url)
                 next_page = await browser.new_page()
                 try:
                     next_response = await next_page.goto(page_url, wait_until="domcontentloaded", timeout=timeout_ms)
                     if next_response and next_response.status >= 400:
+                        pagination_complete = False
+                        pagination_stop_reason = f"http_{next_response.status}"
                         break
                     await next_page.wait_for_timeout(500)
                     await maybe_load_more(next_page)
                     product_links.extend(await discover_product_links(next_page))
                     page_url = await discover_next_page_url(next_page)
+                except Exception as exc:
+                    pagination_complete = False
+                    pagination_stop_reason = f"page_error:{type(exc).__name__}"
+                    break
                 finally:
                     await next_page.close()
             # Prefer product-page records when product links exist, because those pages expose richer
@@ -520,6 +534,7 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             # Generic fallback: visit discovered product links and parse JSON-LD. Not guaranteed to
             # discover all pagination/subcategories; validation must fail closed if coverage is thin.
             seen_product_urls: set[str] = set()
+            product_parse_failures = []
             for product_url in product_links:
                 if product_url in seen_product_urls:
                     continue
@@ -527,6 +542,8 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                 rec = await parse_product_page(browser, product_url, category, location, crawl_date, timeout_ms)
                 if rec:
                     records.append(rec)
+                else:
+                    product_parse_failures.append(product_url)
                 await asyncio.sleep(delay / 2)
             for product_url, sub_category in subcategory_product_links:
                 if product_url in seen_product_urls:
@@ -536,6 +553,8 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                 rec = await parse_product_page(browser, product_url, sub_meta, location, crawl_date, timeout_ms)
                 if rec:
                     records.append(rec)
+                else:
+                    product_parse_failures.append(product_url)
                 await asyncio.sleep(delay / 2)
             await page.close()
             # Remove duplicates within this category.
@@ -546,10 +565,15 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                     unique[key] = rec
             rows = list(unique.values())
             stats = {
-                "category": name, "url": url, "attempt": attempt, "status": "ok" if rows else "empty_or_unparsed",
+                "category": name, "url": url, "attempt": attempt,
+                "status": "ok" if rows and pagination_complete and not product_parse_failures else "incomplete",
                 "records": len(rows), "discovered_product_links": len(seen_product_urls),
                 "discovered_subcategories": len(subcategories), "pagination_pages_visited": len(page_urls_seen),
-                "store_evidence": evidence, "error": "" if rows else "no_parseable_product_records"
+                "pagination_complete": pagination_complete, "pagination_stop_reason": pagination_stop_reason,
+                "product_parse_failures": product_parse_failures,
+                "store_evidence": evidence,
+                "error": "" if rows and pagination_complete and not product_parse_failures else
+                         "incomplete_collection_or_product_parse_failure"
             }
             LOG.info("category_finish location=%s category=%s records=%d links=%d status=%s",
                      location.get("id"), name, len(rows), len(product_links), stats["status"])
