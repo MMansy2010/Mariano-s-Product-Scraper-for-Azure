@@ -1,7 +1,10 @@
 import os
 import re
+from dotenv import load_dotenv
 import requests
 from requests.auth import HTTPBasicAuth
+
+load_dotenv()
 
 BASE = "https://api.kroger.com/v1"
 

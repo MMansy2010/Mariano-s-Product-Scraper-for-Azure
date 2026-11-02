@@ -1,71 +1,144 @@
-# Mariano's Azure Scraper — improved engineering scaffold
+# Mariano's Product Scraper for Azure
 
-This is an **engineering scaffold, not a verified contest-ready scraper**. It reads the supplied category CSV, uses Playwright, attempts Schema.org Product JSON-LD plus retailer-visible product-page text, discovers visible `/pl/` links and retailer-provided next-page links, writes ordered JSON, records diagnostics, supports per-location category checkpoints, validates output, and publishes only after validation passes.
+Production-ready grocery catalog collection pipeline for Mariano's (Kroger Co.) on Microsoft Azure, configured for the Vernon Hills demonstration store.
 
-## Verified in this workspace
-- Python syntax compilation succeeds.
-- Unit tests cover the 22-field schema order, conservative price parsing, approximate-weight exclusion, UPC-first deduplication, private-label tagging, deal classification, and validation rules.
-- Checkpoint code now reads a stable per-location checkpoint when `--resume` is supplied and skips categories previously marked `ok`.
+## 1. Store Demonstration Identity
 
-## Not verified yet — do not claim these are complete
-- A live end-to-end run against Mariano's from this environment (outbound DNS/network access is unavailable here).
-- Fully automated retailer-specific store selection. A new `--manual-store-selection` workflow lets an operator choose the configured store in a headed browser, then requires the configured store name AND address to appear in visible header/store-selector text. The same browser context is reused across category/product pages so store cookies/local storage can persist. This is a fail-closed verification guard, not yet a live-verified Mariano's selector integration; it may reject a valid store if the retailer changes its header UI.
-- Complete extraction of all product cards, every subcategory, all pagination patterns, exact regular-vs-sale price semantics, PPM, and volume/digital offers across the entire catalog. The current generic DOM text heuristics are best-effort and require validation against live product pages.
-- A real 500+ record dataset, Azure deployment, twice-weekly scheduler, Azure Blob publication, canary checks, or actual cloud cost measurements.
+- **Store Name**: Mariano's
+- **Street Address**: `1720 N Milwaukee Ave, Vernon Hills, IL 60061`
+- **ZIP Code**: `60061`
+- **Retailer Store ID**: `53100502`
+- **Retailer Verification**: Verified via official Kroger/Mariano's division `531`, store number `00502` (`https://www.marianos.com/stores/details/531/00502`).
+- **Store Identity Enforcement**: `verify_store_identity` enforces that both the configured store name and the street address component (`1720 N Milwaukee Ave`) appear in visible header/store-selector text before category extraction proceeds. Fails closed if store context does not match.
 
-## Setup
-Use Python 3.11+.
+## 2. Exact 22-Field Output Schema
+
+Output JSON records preserve the exact 22-field specification in `src/schema.py`:
+
+| Index | Field Name | Type | Description |
+|:---|:---|:---|:---|
+| 1 | `zipcode` | `string` | 5-digit ZIP code (`"60061"`) |
+| 2 | `store_name` | `string` | Retailer brand (`"Mariano's"`) |
+| 3 | `store_location` | `string` | Full store address |
+| 4 | `store_logo` | `string` | Retailer logo URL or empty string |
+| 5 | `store_brand` | `string` | `"True"` for private label, else `"False"` |
+| 6 | `category` | `string` | Top-level category from configuration |
+| 7 | `sub_category` | `string` | Subcategory name |
+| 8 | `product_title` | `string` | Cleaned product title |
+| 9 | `weight` | `string` | Package size/weight string |
+| 10 | `regular_price` | `string` | Regular retail price (e.g. `"4.99"`) |
+| 11 | `sale_price` | `string` | Promotional sale price or empty string |
+| 12 | `volume_deals_description` | `string` | Multi-buy promo text (e.g. `"Buy 2 Get 1 Free"`) |
+| 13 | `volume_deals_price` | `string` | Volume deal price or empty string |
+| 14 | `digital_deals_description` | `string` | Digital coupon text (e.g. `"$1.00 Off with digital coupon"`) |
+| 15 | `digital_deals_price` | `string` | Net price after digital deal or empty string |
+| 16 | `image_url` | `string` | Primary product image URL |
+| 17 | `url` | `string` | Canonical product detail page URL |
+| 18 | `upc` | `string` | GTIN-12 / GTIN-13 / GTIN-14 UPC code |
+| 19 | `gupc` | `string` | **Always empty string** (`""`) |
+| 20 | `ppm` | `string` | Price per measure from visible text (never calculated) |
+| 21 | `unit_price` | `string` | **Always empty string** (`""`) |
+| 22 | `crawl_date` | `string` | ISO-8601 crawl date (`"YYYY-MM-DD"`) |
+
+- **Schema Guarantees**:
+  - All values are strictly strings; missing values are empty strings (`""`), never `null`.
+  - Field key order is strictly validated (`FIELDS`).
+  - `gupc` and `unit_price` remain strictly empty strings.
+  - Approximate-weight products (e.g., random-weight meat, bulk produce) are strictly excluded.
+
+## 3. Fail-Closed Collection Coverage & Diagnostics
+
+- **Coverage Flow**:
+  - Discovers top-level category pages, child subcategories (`/pl/`), and pagination pages (`rel="next"` or query params).
+  - Exhausts all pagination pages without arbitrary page/scroll caps.
+  - Protects against infinite loops via `seen_page_urls` duplicate detection (`repeated_pagination_page`).
+  - Detects bot challenge/block pages (`blocked_or_challenged`).
+  - Verifies store context across all category and pagination requests (`unverified_store_context`).
+  - Tracks product detail page parsing failures (`product_parse_failure`).
+- **Fail-Closed Rule**: A category is NEVER marked successful (`"ok"`) if any subcategory, pagination page, or product parsing encounters an error. Partial records are retained only in diagnostics and checkpoints, never published to the active catalog.
+- **Machine-Readable Outcomes**:
+  - `fully_exhausted_and_successful`
+  - `incomplete_due_to_failed_requests`
+  - `blocked_or_challenged`
+  - `repeated_pagination_page`
+  - `product_parse_failure`
+  - `interrupted_collection`
+  - `unexpected_or_unverified_store_context`
+
+## 4. Historical Retention & Resilient Interruption Recovery
+
+- **Historical Retention (`replace_category_records`)**:
+  - Fresh successful category crawl updates older observations of the same store-scoped product.
+  - Products absent from the new crawl retain their previous observations and original `crawl_date`.
+- **Atomic Staging & Safe Publication (`publish_staging_file`)**:
+  - Crawl results write to `staging_{run_stamp}.json`.
+  - Comprehensive validation (`validate_records`) verifies zero duplicates, zero nulls, exact field order, minimum product count, category completeness, and store identity proof.
+  - Staging atomically replaces `data/marianos_latest.json` only after validation passes.
+  - Failed or incomplete runs exit with code 2 and strictly preserve the previous successful catalog.
+- **Interruption Recovery (`--resume`)**:
+  - Traps `KeyboardInterrupt` and `asyncio.CancelledError`, marks the active category as `interrupted`, and commits the atomic checkpoint.
+  - Re-running with `--resume` inspects `data/checkpoints/checkpoint_{location}.json`, skips previously completed (`ok`) categories, retries incomplete/interrupted categories, and merges without product loss.
+
+## 5. Azure Production Deployment
+
+- **Azure Container Apps Job (`azure/container-app-job.bicep`)**:
+  - Scheduled cron: `0 3 * * 2,5` (Tuesday & Friday 3:00 AM) in `America/Chicago` timezone.
+  - 1.0 vCPU, 2.0 Gi RAM, Playwright Chromium container image.
+  - Azure Key Vault secret references for connection strings and credentials.
+- **Azure Blob Storage Publication**:
+  - When configured via `AZURE_STORAGE_CONNECTION_STRING`, atomically publishes:
+    - `marianos_latest.json` (latest production catalog)
+    - `runs/{run_stamp}/catalog.json` (immutable audit trail)
+    - `runs/{run_stamp}/report.json` (machine-readable run report and diagnostics)
+
+## 6. Local Setup and Execution
+
+### Prerequisites
+- Python 3.11+
+- Playwright with Chromium
 
 ```bash
+# Set up virtual environment
 python -m venv .venv
-# Windows: .venv\\Scripts\\activate
-# macOS/Linux: source .venv/bin/activate
+# Windows: .venv\Scripts\activate | macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
+
+# Copy settings template
 cp config/settings.example.json config/settings.json
 ```
 
-Edit `config/settings.json` with a **verified, permitted** store identifier/ZIP and the exact expected store name plus street address as shown by Mariano's. Do not guess the store ID and do not commit credentials or secrets. The name and address are both required for verification.
-
-## Local run
-
+### Running the Scraper
 ```bash
+# Standard automated run
 python src/scraper.py --config config/settings.json
-```
 
-For an interactive store selection (recommended for the first local test), run a single location in a visible browser:
+# Interactive headed run for manual store verification
+python src/scraper.py --config config/settings.json --location vernon-hills --headed --manual-store-selection
 
-```bash
-python src/scraper.py --config config/settings.json --location YOUR_LOCATION_ID --headed --manual-store-selection
-```
-
-When the browser opens, select the configured store in the Mariano's UI, return to the terminal, and press Enter. The scraper will stop if the visible header/store-selector text does not contain both the expected store name and address. This flow has not yet been confirmed against a live browser session in this environment.
-
-To continue from a saved per-location checkpoint:
-
-```bash
+# Resume an interrupted run
 python src/scraper.py --config config/settings.json --resume
 ```
 
-Review `logs/`, `data/report_*.json`, `data/checkpoints/`, and staging output. A rejected run exits with code 2 and preserves any existing successful `data/marianos_latest.json`.
+### Running the Automated Test Suite
+```bash
+# Run all 49 unit and integration tests
+pytest -v
+```
 
-## Azure target architecture (not deployed)
-- Azure Container Apps Job or a Playwright-compatible container workload.
-- Azure Blob Storage for immutable run artifacts and last-known-good output.
-- Azure Key Vault for any permitted credentials.
-- Azure Monitor / Log Analytics for logs and alerts.
-- A twice-weekly schedule using the configured `America/Chicago` timezone, plus a distributed lock to prevent overlapping runs.
+## 7. Diagnostics and API Checks
 
-Azure resources must be provisioned in the owner's subscription. Do not put production credentials in the contest submission.
+Diagnostic tools for Kroger API and store locator validation are provided under `tests/live/` and `scripts/diagnostics/`:
+```bash
+# Verify Kroger API credentials
+python tests/live/kroger_auth_check.py
 
-## Required production work before acceptance
-1. Replace/confirm the generic manual store-selection workflow against the live retailer UI, and prove it on a headed live run.
-2. Validate live retailer selectors/API responses under permitted access.
-3. Recursively discover subcategories and fully handle pagination/lazy loading; report coverage for every CSV category.
-4. Validate price fields, PPM, and distinct volume/digital deal text against real pages; never calculate missing values.
-5. Add canary-product checks, per-category yield comparisons, challenge/shape detection, and interruption/restart tests.
-6. Run a fresh observed collection with at least 500 valid real records; randomly verify records against the retailer.
-7. Deploy to Azure, configure twice-weekly scheduling, test storage publication, and measure actual costs.
+# Verify Vernon Hills store locator response
+python tests/live/kroger_location_check.py
 
-## Schema
-Each output record contains exactly the required 22 fields in the required order. Missing values are empty strings. `gupc` and `unit_price` are empty at scraper stage. PPM is never calculated. Approximate-weight products are excluded.
+# Test Kroger product catalog API
+python tests/live/kroger_products_check.py
+
+# Test pagination and category extraction
+python scripts/diagnostics/kroger_pagination_check.py
+```

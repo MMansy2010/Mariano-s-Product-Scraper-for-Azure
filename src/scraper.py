@@ -17,10 +17,23 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
-from schema import (FIELDS, blank_record, clean_text, numeric_price, is_approx_weight,
-                    classify_deals, is_private_label, product_key, validate_records, verify_store_identity)
-
-import logging
+from schema import (
+    FIELDS,
+    blank_record,
+    clean_text,
+    numeric_price,
+    is_approx_weight,
+    classify_deals,
+    is_private_label,
+    product_key,
+    validate_records,
+    verify_store_identity,
+    replace_category_records,
+    location_record_matches,
+    load_previous_catalog,
+    apply_category_result,
+    publish_staging_file,
+)
 
 LOG = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,134 +42,65 @@ DATA_DIR = ROOT / "data"
 LOG_DIR = ROOT / "logs"
 CHECKPOINT_DIR = DATA_DIR / "checkpoints"
 
+VALID_CATEGORY_STATUSES = {
+    "ok",
+    "incomplete",
+    "failed",
+    "incomplete_failed_requests",
+    "incomplete_due_to_failed_requests",
+    "blocked_or_challenged",
+    "repeated_pagination_page",
+    "product_parse_failure",
+    "interrupted",
+    "interrupted_collection",
+    "unverified_store_context",
+    "unexpected_or_unverified_store_context",
+}
 
-def replace_category_records(existing_records, category_name, new_records):
-    """Merge a recrawled category without deleting historically observed products.
-
-    Fresh observations replace older versions of the same store-scoped product.
-    Products absent from the new crawl remain with their original crawl_date.
-    Approximate-weight products are excluded from both sources.
-    """
-    preserved_other_categories = [
-        record for record in existing_records
-        if record.get("category") != category_name
-    ]
-
-    previous_category = [
-        record for record in existing_records
-        if record.get("category") == category_name
-        and not is_approx_weight(
-            record.get("weight", ""),
-            record.get("product_title", ""),
-        )
-    ]
-
-    fresh_category = [
-        record for record in new_records
-        if not is_approx_weight(
-            record.get("weight", ""),
-            record.get("product_title", ""),
-        )
-    ]
-
-    merged = {}
-
-    # Keep historical records first. Their original crawl_date is preserved.
-    for record in previous_category:
-        merged.setdefault(product_key(record), record)
-
-    # Fresh observations take precedence for matching store-scoped identities.
-    for record in fresh_category:
-        merged[product_key(record)] = record
-
-    return preserved_other_categories + list(merged.values())
+OUTCOME_FULLY_EXHAUSTED = "fully_exhausted_and_successful"
+OUTCOME_FAILED_REQUESTS = "incomplete_due_to_failed_requests"
+OUTCOME_BLOCKED_OR_CHALLENGED = "blocked_or_challenged"
+OUTCOME_REPEATED_PAGE = "repeated_pagination_page"
+OUTCOME_PRODUCT_PARSE_FAILURE = "product_parse_failure"
+OUTCOME_INTERRUPTED = "interrupted_collection"
+OUTCOME_UNVERIFIED_STORE = "unexpected_or_unverified_store_context"
 
 
-def location_record_matches(record, location):
-    """Match a catalog record to a configured store using the schema's store fields."""
-    pairs = (
-        ("zipcode", "zipcode"),
-        ("store_name", "store_name"),
-        ("store_location", "store_location"),
-    )
-    expected = [
-        (clean_text(record.get(record_key)), clean_text(location.get(config_key)))
-        for record_key, config_key in pairs
-    ]
-    return all(left and right and left.casefold() == right.casefold()
-               for left, right in expected)
-
-
-def load_previous_catalog(path):
-    """Load a previously published catalog or fail closed if its structure is unsafe."""
-    if not path.exists():
-        return []
+def publish_to_azure_blob(staging_path: Path, report_path: Path, run_stamp: str, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Upload validated run artifacts and latest catalog to Azure Blob Storage if configured."""
+    azure_cfg = cfg.get("azure", {})
+    conn_str = os.getenv("AZURE_STORAGE_CONNECTION_STRING") or azure_cfg.get("connection_string", "")
+    container_name = os.getenv("AZURE_STORAGE_CONTAINER_NAME") or azure_cfg.get("container_name", "marianos-catalog")
+    if not conn_str or not container_name:
+        LOG.info("azure_blob_publish_skipped (connection string or container name not configured)")
+        return {"published": False, "reason": "not_configured"}
 
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        from azure.storage.blob import BlobServiceClient
+    except ImportError:
+        LOG.warning("azure_blob_publish_skipped (azure-storage-blob package not installed)")
+        return {"published": False, "reason": "package_not_installed"}
+
+    try:
+        client = BlobServiceClient.from_connection_string(conn_str)
+        container_client = client.get_container_client(container_name)
+        if not container_client.exists():
+            container_client.create_container()
+
+        catalog_blob = container_client.get_blob_client(f"runs/{run_stamp}/catalog.json")
+        catalog_blob.upload_blob(staging_path.read_bytes(), overwrite=True)
+
+        report_blob = container_client.get_blob_client(f"runs/{run_stamp}/report.json")
+        report_blob.upload_blob(report_path.read_bytes(), overwrite=True)
+
+        latest_blob = container_client.get_blob_client("marianos_latest.json")
+        latest_blob.upload_blob(staging_path.read_bytes(), overwrite=True)
+
+        LOG.info("azure_blob_publish_success container=%s run=%s", container_name, run_stamp)
+        return {"published": True, "container": container_name, "run_stamp": run_stamp}
     except Exception as exc:
-        raise RuntimeError(
-            f"Previous catalog is unreadable; refusing to start: {type(exc).__name__}"
-        ) from exc
-
-    if not isinstance(data, list) or not data:
-        raise RuntimeError("Previous catalog must be a non-empty JSON list; refusing to start.")
-
-    retained = []
-    required = (
-        "zipcode", "store_name", "store_location", "category",
-        "product_title", "url", "crawl_date",
-    )
-
-    for index, record in enumerate(data):
-        if not isinstance(record, dict) or list(record.keys()) != FIELDS:
-            raise RuntimeError(
-                f"Previous catalog record {index} does not match the exact 22-field schema."
-            )
-        if any(not isinstance(value, str) for value in record.values()):
-            raise RuntimeError(
-                f"Previous catalog record {index} contains a non-string value."
-            )
-        if any(not record.get(field, "").strip() for field in required):
-            raise RuntimeError(
-                f"Previous catalog record {index} is missing a required value."
-            )
-        if record["gupc"] != "" or record["unit_price"] != "":
-            raise RuntimeError(
-                f"Previous catalog record {index} violates the blank gupc/unit_price rule."
-            )
-
-        # Approximate-weight products are excluded, not retained as historical products.
-        if not is_approx_weight(record["weight"], record["product_title"]):
-            retained.append(record)
-
-    keys = [product_key(record) for record in retained]
-    if len(keys) != len(set(keys)):
-        raise RuntimeError("Previous catalog contains duplicate store-scoped product identities.")
-
-    LOG.info(
-        "previous_catalog_loaded records=%d approximate_weight_excluded=%d",
-        len(retained), len(data) - len(retained),
-    )
-    return retained
-
-
-def apply_category_result(existing_records, category_name, new_records, status):
-    """Only a fully successful category crawl may replace historical observations."""
-    if status != "ok":
-        return list(existing_records)
-    return replace_category_records(existing_records, category_name, new_records)
-
-
-def publish_staging_file(staging_path, final_path):
-    """Atomically publish a completed file while preserving the previous output."""
-    publish_temp = final_path.with_name(final_path.name + ".tmp")
-    try:
-        shutil.copy2(staging_path, publish_temp)
-        publish_temp.replace(final_path)
-    finally:
-        if publish_temp.exists():
-            publish_temp.unlink()
+        LOG.error("azure_blob_publish_failed error=%s", type(exc).__name__)
+        return {"published": False, "error": f"{type(exc).__name__}: {str(exc)}"}
 
 
 def setup_logging() -> None:
@@ -293,7 +237,7 @@ def is_checkpoint_compatible(
         if category in seen_categories:
             return False
         seen_categories.add(category)
-        if item.get("status") not in ("ok", "incomplete", "failed"):
+        if item.get("status") not in VALID_CATEGORY_STATUSES:
             return False
 
     return True
@@ -594,6 +538,9 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
     timeout_ms = int(cfg.get("request_timeout_ms", 45000))
     delay = float(cfg.get("navigation_delay_seconds", 2.0))
     last_error = ""
+    last_outcome = OUTCOME_FAILED_REQUESTS
+    last_status = "incomplete_failed_requests"
+
     for attempt in range(1, max_retries + 1):
         page = await browser.new_page()
         try:
@@ -602,65 +549,173 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
             response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
             if response and response.status >= 400:
                 last_error = f"http_{response.status}"
+                last_outcome = OUTCOME_FAILED_REQUESTS
+                last_status = "incomplete_failed_requests"
                 LOG.warning("category_http_error category=%s status=%s", name, response.status)
                 await page.close()
                 await asyncio.sleep(delay * attempt)
                 continue
+
             await page.wait_for_timeout(1200)
             evidence = await page_store_evidence(page, location)
             if not evidence["selected_store_verified"]:
                 last_error = "selected_store_not_verified"
+                last_outcome = OUTCOME_UNVERIFIED_STORE
+                last_status = "unverified_store_context"
                 LOG.error("store_verification_failed location=%s expected_name=%r expected_address=%r header=%r",
                           location.get("id"), location.get("store_name"), location.get("store_location"),
                           evidence.get("header_text", ""))
                 await page.close()
                 break
+
             body_lower = (evidence["body_excerpt"] + " " + evidence.get("header_text", "")).lower()
             if any(term in body_lower for term in ("access denied", "verify you are human", "robot or human", "unusual traffic")):
                 last_error = "possible_block_or_challenge"
+                last_outcome = OUTCOME_BLOCKED_OR_CHALLENGED
+                last_status = "blocked_or_challenged"
                 LOG.error("possible_block category=%s url=%s", name, page.url)
                 await page.close()
                 break
+
             scroll_result = await maybe_load_more(page)
             if not scroll_result.get("complete"):
                 last_error = "incomplete_infinite_scroll"
+                last_outcome = OUTCOME_FAILED_REQUESTS
+                last_status = "incomplete_failed_requests"
                 LOG.error("infinite_scroll_incomplete category=%s details=%r", name, scroll_result)
                 await page.close()
                 break
+
             product_links = await discover_product_links(page)
-            # Follow retailer-linked subcategory pages; keep only links actually exposed by the page.
+
+            # Discover and follow retailer-linked subcategory pages
             subcategories = await discover_subcategory_links(page, url)
             subcategory_product_links: list[tuple[str, str]] = []
-            subcategory_failures: list[dict[str, str]] = []
+            subcategory_failures: list[dict[str, Any]] = []
+
             for sub in subcategories:
+                sub_url = sub["url"]
+                sub_name = sub["sub_category"]
                 sub_page = await browser.new_page()
                 try:
-                    sub_response = await sub_page.goto(sub["url"], wait_until="domcontentloaded", timeout=timeout_ms)
+                    sub_response = await sub_page.goto(sub_url, wait_until="domcontentloaded", timeout=timeout_ms)
                     if sub_response and sub_response.status >= 400:
-                        LOG.warning("subcategory_http_error category=%s subcategory=%s status=%s", name, sub["sub_category"], sub_response.status)
-                        subcategory_failures.append({"subcategory": sub["sub_category"], "error": f"http_{sub_response.status}"})
+                        LOG.warning("subcategory_http_error category=%s subcategory=%s status=%s", name, sub_name, sub_response.status)
+                        subcategory_failures.append({
+                            "subcategory": sub_name,
+                            "url": sub_url,
+                            "error": f"http_{sub_response.status}",
+                            "outcome": OUTCOME_FAILED_REQUESTS,
+                        })
                         continue
+
                     await sub_page.wait_for_timeout(700)
+                    sub_evidence = await page_store_evidence(sub_page, location)
+                    if not sub_evidence.get("selected_store_verified"):
+                        LOG.error("subcategory_store_unverified category=%s subcategory=%s", name, sub_name)
+                        subcategory_failures.append({
+                            "subcategory": sub_name,
+                            "url": sub_url,
+                            "error": "selected_store_not_verified",
+                            "outcome": OUTCOME_UNVERIFIED_STORE,
+                        })
+                        continue
+
+                    sub_body_lower = (sub_evidence.get("body_excerpt", "") + " " + sub_evidence.get("header_text", "")).lower()
+                    if any(term in sub_body_lower for term in ("access denied", "verify you are human", "robot or human", "unusual traffic")):
+                        LOG.error("subcategory_block category=%s subcategory=%s", name, sub_name)
+                        subcategory_failures.append({
+                            "subcategory": sub_name,
+                            "url": sub_url,
+                            "error": "possible_block_or_challenge",
+                            "outcome": OUTCOME_BLOCKED_OR_CHALLENGED,
+                        })
+                        continue
+
                     sub_scroll = await maybe_load_more(sub_page)
                     if not sub_scroll.get("complete"):
-                        subcategory_failures.append({"subcategory": sub["sub_category"], "error": "incomplete_infinite_scroll"})
+                        subcategory_failures.append({
+                            "subcategory": sub_name,
+                            "url": sub_url,
+                            "error": "incomplete_infinite_scroll",
+                            "outcome": OUTCOME_FAILED_REQUESTS,
+                        })
                         continue
-                    for product_url in await discover_product_links(sub_page):
-                        subcategory_product_links.append((product_url, sub["sub_category"]))
+
+                    for p_url in await discover_product_links(sub_page):
+                        subcategory_product_links.append((p_url, sub_name))
+
+                    # Follow subcategory pagination pages
+                    sub_next_url = await discover_next_page_url(sub_page)
+                    sub_urls_seen = {sub_url}
+                    while sub_next_url:
+                        if sub_next_url in sub_urls_seen:
+                            subcategory_failures.append({
+                                "subcategory": sub_name,
+                                "url": sub_next_url,
+                                "error": "repeated_page_detected",
+                                "outcome": OUTCOME_REPEATED_PAGE,
+                            })
+                            break
+                        sub_urls_seen.add(sub_next_url)
+                        sub_next_page = await browser.new_page()
+                        try:
+                            sub_next_resp = await sub_next_page.goto(sub_next_url, wait_until="domcontentloaded", timeout=timeout_ms)
+                            if sub_next_resp and sub_next_resp.status >= 400:
+                                subcategory_failures.append({
+                                    "subcategory": sub_name,
+                                    "url": sub_next_url,
+                                    "error": f"http_{sub_next_resp.status}",
+                                    "outcome": OUTCOME_FAILED_REQUESTS,
+                                })
+                                break
+                            await sub_next_page.wait_for_timeout(500)
+                            sub_next_scroll = await maybe_load_more(sub_next_page)
+                            if not sub_next_scroll.get("complete"):
+                                subcategory_failures.append({
+                                    "subcategory": sub_name,
+                                    "url": sub_next_url,
+                                    "error": "incomplete_infinite_scroll_on_next_page",
+                                    "outcome": OUTCOME_FAILED_REQUESTS,
+                                })
+                                break
+                            for p_url in await discover_product_links(sub_next_page):
+                                subcategory_product_links.append((p_url, sub_name))
+                            sub_next_url = await discover_next_page_url(sub_next_page)
+                        except Exception as exc:
+                            subcategory_failures.append({
+                                "subcategory": sub_name,
+                                "url": sub_next_url,
+                                "error": f"page_error:{type(exc).__name__}",
+                                "outcome": OUTCOME_FAILED_REQUESTS,
+                            })
+                            break
+                        finally:
+                            await sub_next_page.close()
+
                 except Exception as e:
-                    LOG.warning("subcategory_error category=%s subcategory=%s error=%s", name, sub["sub_category"], type(e).__name__)
-                    subcategory_failures.append({"subcategory": sub["sub_category"], "error": type(e).__name__})
+                    LOG.warning("subcategory_error category=%s subcategory=%s error=%s", name, sub_name, type(e).__name__)
+                    subcategory_failures.append({
+                        "subcategory": sub_name,
+                        "url": sub_url,
+                        "error": type(e).__name__,
+                        "outcome": OUTCOME_FAILED_REQUESTS,
+                    })
                 finally:
                     await sub_page.close()
-            # Also follow retailer-provided pagination links, never invent page numbers.
+
+            # Follow retailer-provided pagination links on main category
             page_url = await discover_next_page_url(page)
             page_urls_seen = {url}
             pagination_complete = True
             pagination_stop_reason = "no_next_page"
+            pagination_outcome = OUTCOME_FULLY_EXHAUSTED
+
             while page_url:
                 if page_url in page_urls_seen:
                     pagination_complete = False
                     pagination_stop_reason = "repeated_page_detected"
+                    pagination_outcome = OUTCOME_REPEATED_PAGE
                     break
                 page_urls_seen.add(page_url)
                 next_page = await browser.new_page()
@@ -669,12 +724,26 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                     if next_response and next_response.status >= 400:
                         pagination_complete = False
                         pagination_stop_reason = f"http_{next_response.status}"
+                        pagination_outcome = OUTCOME_FAILED_REQUESTS
                         break
                     await next_page.wait_for_timeout(500)
+                    next_evidence = await page_store_evidence(next_page, location)
+                    if not next_evidence.get("selected_store_verified"):
+                        pagination_complete = False
+                        pagination_stop_reason = "unverified_store_context"
+                        pagination_outcome = OUTCOME_UNVERIFIED_STORE
+                        break
+                    next_body_lower = (next_evidence.get("body_excerpt", "") + " " + next_evidence.get("header_text", "")).lower()
+                    if any(term in next_body_lower for term in ("access denied", "verify you are human", "robot or human", "unusual traffic")):
+                        pagination_complete = False
+                        pagination_stop_reason = "possible_block_or_challenge"
+                        pagination_outcome = OUTCOME_BLOCKED_OR_CHALLENGED
+                        break
                     next_scroll = await maybe_load_more(next_page)
                     if not next_scroll.get("complete"):
                         pagination_complete = False
                         pagination_stop_reason = "incomplete_infinite_scroll_on_next_page"
+                        pagination_outcome = OUTCOME_FAILED_REQUESTS
                         LOG.error(
                             "next_page_infinite_scroll_incomplete category=%s url=%s details=%r",
                             name, page_url, next_scroll
@@ -685,15 +754,18 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                 except Exception as exc:
                     pagination_complete = False
                     pagination_stop_reason = f"page_error:{type(exc).__name__}"
+                    pagination_outcome = OUTCOME_FAILED_REQUESTS
                     break
                 finally:
                     await next_page.close()
+
             # Prefer product-page records when product links exist, because those pages expose richer
             # price/deal/PPM context. Use category JSON-LD only as a fallback when no product links exist.
             category_jsonld = [] if (product_links or subcategory_product_links) else await extract_jsonld(page)
             records = []
             excluded_approx_weight = []
             product_parse_failures = []
+
             for p in category_jsonld:
                 title = clean_text(p.get("name"))
                 if not title:
@@ -729,8 +801,7 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                     "crawl_date": crawl_date,
                 })
                 records.append(rec)
-            # Generic fallback: visit discovered product links and parse JSON-LD. Not guaranteed to
-            # discover all pagination/subcategories; validation must fail closed if coverage is thin.
+
             seen_product_urls: set[str] = set()
             for product_url in product_links:
                 if product_url in seen_product_urls:
@@ -752,6 +823,7 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                         "reason": result["reason"],
                     })
                 await asyncio.sleep(delay / 2)
+
             for product_url, sub_category in subcategory_product_links:
                 if product_url in seen_product_urls:
                     continue
@@ -773,7 +845,9 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                         "reason": result["reason"],
                     })
                 await asyncio.sleep(delay / 2)
+
             await page.close()
+
             # Remove duplicates within this category.
             unique = {}
             for rec in records:
@@ -781,38 +855,95 @@ async def crawl_category(browser, category: dict[str, str], location: dict[str, 
                 if key not in ("title:", "url:") and key not in unique:
                     unique[key] = rec
             rows = list(unique.values())
+
+            # Determine machine-readable status & outcome
+            if not pagination_complete:
+                if pagination_outcome == OUTCOME_REPEATED_PAGE:
+                    cat_status = "repeated_pagination_page"
+                    cat_outcome = OUTCOME_REPEATED_PAGE
+                    cat_error = "repeated_page_detected"
+                elif pagination_outcome == OUTCOME_BLOCKED_OR_CHALLENGED:
+                    cat_status = "blocked_or_challenged"
+                    cat_outcome = OUTCOME_BLOCKED_OR_CHALLENGED
+                    cat_error = "pagination_block_detected"
+                elif pagination_outcome == OUTCOME_UNVERIFIED_STORE:
+                    cat_status = "unverified_store_context"
+                    cat_outcome = OUTCOME_UNVERIFIED_STORE
+                    cat_error = "pagination_store_verification_failed"
+                else:
+                    cat_status = "incomplete_failed_requests"
+                    cat_outcome = OUTCOME_FAILED_REQUESTS
+                    cat_error = f"pagination_incomplete:{pagination_stop_reason}"
+            elif product_parse_failures:
+                cat_status = "product_parse_failure"
+                cat_outcome = OUTCOME_PRODUCT_PARSE_FAILURE
+                cat_error = f"product_parse_failures:{len(product_parse_failures)}"
+            elif subcategory_failures:
+                first_sub = subcategory_failures[0]
+                sub_out = first_sub.get("outcome", OUTCOME_FAILED_REQUESTS)
+                if sub_out == OUTCOME_FAILED_REQUESTS:
+                    cat_status = "incomplete_failed_requests"
+                elif sub_out == OUTCOME_BLOCKED_OR_CHALLENGED:
+                    cat_status = "blocked_or_challenged"
+                elif sub_out == OUTCOME_REPEATED_PAGE:
+                    cat_status = "repeated_pagination_page"
+                elif sub_out == OUTCOME_UNVERIFIED_STORE:
+                    cat_status = "unverified_store_context"
+                else:
+                    cat_status = "incomplete"
+                cat_outcome = sub_out
+                cat_error = f"subcategory_failure:{first_sub.get('error')}"
+            elif not rows:
+                cat_status = "incomplete"
+                cat_outcome = "incomplete_no_products_found"
+                cat_error = "no_records_collected"
+            else:
+                cat_status = "ok"
+                cat_outcome = OUTCOME_FULLY_EXHAUSTED
+                cat_error = ""
+
             stats = {
                 "category": name, "url": url, "attempt": attempt,
-                "status": "ok" if rows and pagination_complete and not product_parse_failures and not subcategory_failures else "incomplete",
-                "records": len(rows), "discovered_product_links": len(seen_product_urls),
-                "discovered_subcategories": len(subcategories), "pagination_pages_visited": len(page_urls_seen),
-                "pagination_complete": pagination_complete, "pagination_stop_reason": pagination_stop_reason,
+                "status": cat_status,
+                "outcome": cat_outcome,
+                "records": len(rows),
+                "discovered_product_links": len(seen_product_urls),
+                "discovered_subcategories": len(subcategories),
+                "pagination_pages_visited": len(page_urls_seen),
+                "pagination_complete": pagination_complete,
+                "pagination_stop_reason": pagination_stop_reason,
                 "product_parse_failures": product_parse_failures,
                 "excluded_approx_weight": excluded_approx_weight,
                 "excluded_approx_weight_count": len(excluded_approx_weight),
                 "subcategory_failures": subcategory_failures,
                 "scroll_result": scroll_result,
                 "store_evidence": evidence,
-                "error": "" if rows and pagination_complete and not product_parse_failures and not subcategory_failures else
-                         "incomplete_collection_or_product_parse_failure"
+                "error": cat_error,
             }
-            LOG.info("category_finish location=%s category=%s records=%d links=%d status=%s",
-                     location.get("id"), name, len(rows), len(product_links), stats["status"])
+            LOG.info("category_finish location=%s category=%s records=%d links=%d status=%s outcome=%s",
+                     location.get("id"), name, len(rows), len(seen_product_urls), stats["status"], stats["outcome"])
             return rows, stats
+
         except PlaywrightTimeoutError:
             last_error = "navigation_timeout"
+            last_outcome = OUTCOME_FAILED_REQUESTS
+            last_status = "incomplete_failed_requests"
             LOG.warning("category_timeout category=%s attempt=%d", name, attempt)
         except Exception as e:
             last_error = type(e).__name__
+            last_outcome = OUTCOME_FAILED_REQUESTS
+            last_status = "incomplete_failed_requests"
             LOG.exception("category_error category=%s attempt=%d", name, attempt)
         finally:
             if not page.is_closed():
                 await page.close()
         await asyncio.sleep(delay * attempt)
+
     return [], {
         "category": name,
         "url": url,
-        "status": "failed",
+        "status": last_status if last_status != "ok" else "failed",
+        "outcome": last_outcome,
         "records": 0,
         "discovered_product_links": 0,
         "discovered_subcategories": 0,
@@ -949,11 +1080,11 @@ async def run(args) -> int:
                             # A fully completed checkpoint is not a resumable interrupted run.
                             expected_names = {item["category"] for item in categories}
                             if expected_names and expected_names.issubset(completed_names):
-                                LOG.warning("resume_rejected_completed_checkpoint location=%s; starting fresh",
-                                            location.get("id"))
-                                location_records = list(historical_location_records)
-                                location_stats = []
-                                completed_names = set()
+                                LOG.error(
+                                    "resume_rejected_completed_checkpoint location=%s: checkpoint is already completed; refusing to re-run with --resume",
+                                    location.get("id"),
+                                )
+                                return 2
                         else:
                             LOG.warning(
                                 "checkpoint_invalid_or_mismatched location=%s; starting fresh",
@@ -972,41 +1103,80 @@ async def run(args) -> int:
                             type(e).__name__,
                         )
 
-                for category in categories:
-                    if category["category"] in completed_names:
-                        LOG.info("resume_skip location=%s category=%s", location.get("id"), category["category"])
-                        continue
-                    rows, stats = await crawl_category(context, category, location, cfg, crawl_date)
-                    stats["location_id"] = location.get("id", "")
-                    location_stats = [
-                        s for s in location_stats
-                        if s.get("category") != category["category"]
-                    ]
-                    location_stats.append(stats)
+                try:
+                    for category in categories:
+                        if category["category"] in completed_names:
+                            LOG.info("resume_skip location=%s category=%s", location.get("id"), category["category"])
+                            continue
+                        rows, stats = await crawl_category(context, category, location, cfg, crawl_date)
+                        stats["location_id"] = location.get("id", "")
+                        location_stats = [
+                            s for s in location_stats
+                            if s.get("category") != category["category"]
+                        ]
+                        location_stats.append(stats)
 
-                    # Only a complete category crawl may update the catalog.
-                    # Incomplete results remain in diagnostics/checkpoints, not publication.
-                    location_records = apply_category_result(
-                        location_records, category["category"], rows, stats.get("status")
-                    )
-                    # Keep the checkpoint for failed categories too, but only successful categories are skipped.
+                        # Only a complete category crawl may update the catalog.
+                        # Incomplete results remain in diagnostics/checkpoints, not publication.
+                        location_records = apply_category_result(
+                            location_records, category["category"], rows, stats.get("status")
+                        )
+                        # Keep the checkpoint for failed categories too, but only successful categories are skipped.
+                        checkpoint = {
+                            "run_id": run_stamp,
+                            "location_id": location.get("id"),
+                            "config_fingerprint": current_fingerprint,
+                            "completed_categories": location_stats,
+                            "records_so_far": location_records,
+                        }
+                        temp_checkpoint = checkpoint_path.with_suffix(".tmp")
+                        temp_checkpoint.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8")
+                        temp_checkpoint.replace(checkpoint_path)
+                        location_proofs.append({
+                            "location_id": location.get("id"),
+                            "configured_zipcode": location.get("zipcode", ""),
+                            "configured_store_id": location.get("store_id", ""),
+                            "category": category["category"],
+                            "evidence": stats.get("store_evidence", {})
+                        })
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    LOG.warning("run_interrupted location=%s", location.get("id"))
+                    current_cat_name = category.get("category", "") if "category" in locals() else ""
+                    interrupted_stats = {
+                        "category": current_cat_name,
+                        "url": category.get("url", "") if "category" in locals() else "",
+                        "attempt": 1,
+                        "status": "interrupted",
+                        "outcome": OUTCOME_INTERRUPTED,
+                        "records": 0,
+                        "discovered_product_links": 0,
+                        "discovered_subcategories": 0,
+                        "pagination_pages_visited": 0,
+                        "pagination_complete": False,
+                        "pagination_stop_reason": "interrupted_by_operator",
+                        "product_parse_failures": [],
+                        "excluded_approx_weight": [],
+                        "excluded_approx_weight_count": 0,
+                        "subcategory_failures": [],
+                        "scroll_result": {},
+                        "store_evidence": {},
+                        "error": "interrupted_by_operator",
+                        "location_id": location.get("id", ""),
+                    }
+                    if current_cat_name:
+                        location_stats = [s for s in location_stats if s.get("category") != current_cat_name]
+                        location_stats.append(interrupted_stats)
                     checkpoint = {
-    "run_id": run_stamp,
-    "location_id": location.get("id"),
-    "config_fingerprint": current_fingerprint,
-    "completed_categories": location_stats,
-    "records_so_far": location_records,
-}
+                        "run_id": run_stamp,
+                        "location_id": location.get("id"),
+                        "config_fingerprint": current_fingerprint,
+                        "completed_categories": location_stats,
+                        "records_so_far": location_records,
+                    }
                     temp_checkpoint = checkpoint_path.with_suffix(".tmp")
                     temp_checkpoint.write_text(json.dumps(checkpoint, ensure_ascii=False, indent=2), encoding="utf-8")
                     temp_checkpoint.replace(checkpoint_path)
-                    location_proofs.append({
-                        "location_id": location.get("id"),
-                        "configured_zipcode": location.get("zipcode", ""),
-                        "configured_store_id": location.get("store_id", ""),
-                        "category": category["category"],
-                        "evidence": stats.get("store_evidence", {})
-                    })
+                    raise
                 all_stats.extend(location_stats)
                 all_records.extend(location_records)
         finally:
@@ -1042,6 +1212,9 @@ async def run(args) -> int:
              checks["validation_passed"])
     if checks["validation_passed"]:
         publish_staging_file(staging_path, final_path)
+        azure_result = publish_to_azure_blob(staging_path, report_path, run_stamp, cfg)
+        report["azure_publication"] = azure_result
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         LOG.info("published path=%s", final_path)
         return 0
     LOG.error("run_rejected; previous successful output preserved; report=%s", report_path)

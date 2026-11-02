@@ -196,3 +196,241 @@ def test_checkpoint_accepts_valid_store_scoped_records():
     saved, location, fingerprint = _valid_checkpoint()
 
     assert scraper.is_checkpoint_compatible(saved, location, fingerprint)
+
+
+def test_checkpoint_accepts_all_distinguished_statuses():
+    saved, location, fingerprint = _valid_checkpoint()
+    for status in scraper.VALID_CATEGORY_STATUSES:
+        saved["completed_categories"] = [{"category": "Produce", "status": status}]
+        assert scraper.is_checkpoint_compatible(saved, location, fingerprint), f"Failed for status: {status}"
+
+
+def test_failed_category_preserves_previous_records_in_apply():
+    existing = [
+        {"category": "Produce", "product_title": "Old Apple", "upc": "111", "url": "https://a.test/1", "crawl_date": "2026-10-20"},
+        {"category": "Meat", "product_title": "Beef", "upc": "222", "url": "https://a.test/2", "crawl_date": "2026-10-20"},
+    ]
+    fresh = [
+        {"category": "Produce", "product_title": "Fresh Apple", "upc": "111", "url": "https://a.test/1", "crawl_date": "2026-10-31"},
+    ]
+    # Incomplete / failed statuses must never replace previous records
+    for bad_status in ("incomplete", "failed", "blocked_or_challenged", "repeated_pagination_page", "product_parse_failure", "interrupted"):
+        result = scraper.apply_category_result(existing, "Produce", fresh, bad_status)
+        assert result == existing
+
+
+def test_azure_blob_publish_skipped_when_unconfigured(tmp_path):
+    staging = tmp_path / "staging.json"
+    report = tmp_path / "report.json"
+    staging.write_text("[]", encoding="utf-8")
+    report.write_text("{}", encoding="utf-8")
+
+    result = scraper.publish_to_azure_blob(staging, report, "20261031T120000Z", {})
+    assert result["published"] is False
+    assert result["reason"] == "not_configured"
+
+
+def test_azure_blob_publish_uploads_when_configured(tmp_path, monkeypatch):
+    staging = tmp_path / "staging.json"
+    report = tmp_path / "report.json"
+    staging.write_text("[catalog data]", encoding="utf-8")
+    report.write_text('{"status": "ok"}', encoding="utf-8")
+
+    uploaded_blobs = {}
+
+    class FakeBlobClient:
+        def __init__(self, name):
+            self.name = name
+
+        def upload_blob(self, data, overwrite=False):
+            uploaded_blobs[self.name] = data
+
+    class FakeContainerClient:
+        def exists(self):
+            return True
+
+        def get_blob_client(self, blob_name):
+            return FakeBlobClient(blob_name)
+
+    class FakeServiceClient:
+        @classmethod
+        def from_connection_string(cls, _conn):
+            return cls()
+
+        def get_container_client(self, _name):
+            return FakeContainerClient()
+
+    import sys
+    import types
+    fake_azure = types.ModuleType("azure")
+    fake_storage = types.ModuleType("azure.storage")
+    fake_blob = types.ModuleType("azure.storage.blob")
+    fake_blob.BlobServiceClient = FakeServiceClient
+    monkeypatch.setitem(sys.modules, "azure", fake_azure)
+    monkeypatch.setitem(sys.modules, "azure.storage", fake_storage)
+    monkeypatch.setitem(sys.modules, "azure.storage.blob", fake_blob)
+
+    cfg = {
+        "azure": {
+            "connection_string": "DefaultEndpointsProtocol=https;AccountName=test;AccountKey=fake;EndpointSuffix=core.windows.net",
+            "container_name": "test-container",
+        }
+    }
+
+    result = scraper.publish_to_azure_blob(staging, report, "20261031T120000Z", cfg)
+    assert result["published"] is True
+    assert result["container"] == "test-container"
+    assert "marianos_latest.json" in uploaded_blobs
+    assert "runs/20261031T120000Z/catalog.json" in uploaded_blobs
+    assert "runs/20261031T120000Z/report.json" in uploaded_blobs
+    assert uploaded_blobs["marianos_latest.json"] == b"[catalog data]"
+
+
+def test_interruption_saves_checkpoint_and_resumes_to_completion(tmp_path, monkeypatch):
+    import argparse
+    import asyncio
+    import json
+
+    data_dir = tmp_path / "data"
+    checkpoint_dir = data_dir / "checkpoints"
+    monkeypatch.setattr(scraper, "DATA_DIR", data_dir)
+    monkeypatch.setattr(scraper, "CHECKPOINT_DIR", checkpoint_dir)
+
+    cfg_file = tmp_path / "settings.json"
+    cfg = {
+        "locations": [
+            {
+                "id": "vernon-hills",
+                "zipcode": "60061",
+                "store_name": "Mariano's",
+                "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061",
+                "store_id": "53100502",
+            }
+        ],
+        "min_records_for_publish": 2,
+        "min_categories_with_products": 2,
+    }
+    cfg_file.write_text(json.dumps(cfg), encoding="utf-8")
+
+    cat_file = tmp_path / "categories.csv"
+    cat_file.write_text("Category (Auto),URL\nDairy,https://example.test/dairy\nProduce,https://example.test/produce\n", encoding="utf-8")
+
+    dairy_record = scraper.blank_record()
+    dairy_record.update({
+        "zipcode": "60061",
+        "store_name": "Mariano's",
+        "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061",
+        "category": "Dairy",
+        "product_title": "Mariano's Whole Milk",
+        "url": "https://example.test/milk",
+        "upc": "1111111111111",
+        "crawl_date": "2026-10-31",
+    })
+
+    produce_record = scraper.blank_record()
+    produce_record.update({
+        "zipcode": "60061",
+        "store_name": "Mariano's",
+        "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061",
+        "category": "Produce",
+        "product_title": "Fresh Gala Apples",
+        "url": "https://example.test/apples",
+        "upc": "2222222222222",
+        "crawl_date": "2026-10-31",
+    })
+
+    class FakeContext:
+        async def close(self): pass
+
+    class FakeBrowser:
+        async def new_context(self, **kwargs): return FakeContext()
+        async def close(self): pass
+
+    class FakePlaywright:
+        async def __aenter__(self):
+            class P:
+                chromium = FakeChromium()
+            return P()
+        async def __aexit__(self, *args): pass
+
+    class FakeChromium:
+        async def launch(self, **kwargs): return FakeBrowser()
+
+    monkeypatch.setattr(scraper, "async_playwright", lambda: FakePlaywright())
+
+    crawl_calls = []
+
+    async def fake_crawl_first_run(context, category, location, cfg, crawl_date):
+        name = category["category"]
+        crawl_calls.append(name)
+        if name == "Dairy":
+            return [dairy_record], {
+                "category": "Dairy", "status": "ok", "outcome": scraper.OUTCOME_FULLY_EXHAUSTED,
+                "records": 1, "product_parse_failures": [],
+                "store_evidence": {"selected_store_verified": True},
+            }
+        elif name == "Produce":
+            raise KeyboardInterrupt("Simulated interruption during Produce")
+
+    monkeypatch.setattr(scraper, "crawl_category", fake_crawl_first_run)
+
+    args_run1 = argparse.Namespace(
+        config=str(cfg_file),
+        categories=str(cat_file),
+        location="vernon-hills",
+        headed=False,
+        manual_store_selection=False,
+        resume=False,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(scraper.run(args_run1))
+
+    checkpoint_file = checkpoint_dir / "checkpoint_vernon-hills.json"
+    assert checkpoint_file.exists()
+    cp_data = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    assert cp_data["location_id"] == "vernon-hills"
+    statuses = {c["category"]: c["status"] for c in cp_data["completed_categories"]}
+    assert statuses.get("Dairy") == "ok"
+    assert statuses.get("Produce") == "interrupted"
+    assert len(cp_data["records_so_far"]) == 1
+    assert cp_data["records_so_far"][0]["product_title"] == "Mariano's Whole Milk"
+
+    # Final catalog must NOT exist yet
+    assert not (data_dir / "marianos_latest.json").exists()
+
+    # Now resume the run
+    crawl_calls.clear()
+
+    async def fake_crawl_second_run(context, category, location, cfg, crawl_date):
+        name = category["category"]
+        crawl_calls.append(name)
+        if name == "Produce":
+            return [produce_record], {
+                "category": "Produce", "status": "ok", "outcome": scraper.OUTCOME_FULLY_EXHAUSTED,
+                "records": 1, "product_parse_failures": [],
+                "store_evidence": {"selected_store_verified": True},
+            }
+        raise AssertionError(f"Unexpected crawl call for: {name}")
+
+    monkeypatch.setattr(scraper, "crawl_category", fake_crawl_second_run)
+
+    args_run2 = argparse.Namespace(
+        config=str(cfg_file),
+        categories=str(cat_file),
+        location="vernon-hills",
+        headed=False,
+        manual_store_selection=False,
+        resume=True,
+    )
+
+    exit_code = asyncio.run(scraper.run(args_run2))
+    assert exit_code == 0
+    assert crawl_calls == ["Produce"]
+
+    final_catalog = data_dir / "marianos_latest.json"
+    assert final_catalog.exists()
+    published_records = json.loads(final_catalog.read_text(encoding="utf-8"))
+    assert len(published_records) == 2
+    titles = {r["product_title"] for r in published_records}
+    assert titles == {"Mariano's Whole Milk", "Fresh Gala Apples"}

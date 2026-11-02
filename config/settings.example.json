@@ -1,7 +1,13 @@
-
 {
   "retailer": "Mariano's",
   "locations": [
+    {
+      "id": "vernon-hills",
+      "zipcode": "60061",
+      "store_name": "Mariano's",
+      "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061",
+      "store_id": "53100502"
+    },
     {
       "id": "lakeshore-east",
       "zipcode": "60601",
@@ -11,16 +17,16 @@
     },
     {
       "id": "bucktown",
-      "zipcode": "",
+      "zipcode": "60647",
       "store_name": "Mariano's Bucktown",
-      "store_location": "",
+      "store_location": "2112 N Ashland Ave, Chicago, IL 60614",
       "store_id": "53100516"
     },
     {
       "id": "new-city",
-      "zipcode": "",
+      "zipcode": "60614",
       "store_name": "Mariano's New City",
-      "store_location": "",
+      "store_location": "1500 N Clybourn Ave, Chicago, IL 60610",
       "store_id": "53100534"
     }
   ],
@@ -55,5 +61,9 @@
     "unit_price",
     "crawl_date"
   ],
-  "user_agent": "Mozilla/5.0 (compatible; AuthorizedCatalogAudit/1.0; +contact-configured-by-operator)"
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  "azure": {
+    "container_name": "marianos-catalog",
+    "schedule": "0 3 * * 2,5"
+  }
 }

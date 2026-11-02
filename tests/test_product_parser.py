@@ -167,3 +167,212 @@ def test_product_parser_timeout_is_parse_failure(monkeypatch):
     assert result["record"] is None
     assert result["reason"] == "timeout"
     assert page.closed
+
+
+def test_product_parser_simple_truth_organic_milk_representative(monkeypatch):
+    """Representative source response test: Simple Truth Organic Milk at Vernon Hills store."""
+    page = FakePage()
+    raw_jsonld = {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": "Simple Truth Organic Whole Milk",
+        "image": ["https://www.marianos.com/product/images/xlarge/front/0001111085303"],
+        "description": "Simple Truth Organic Whole Milk 1 Gallon",
+        "sku": "0001111085303",
+        "gtin12": "0001111085303",
+        "brand": {"@type": "Brand", "name": "Simple Truth"},
+        "offers": {
+            "@type": "Offer",
+            "price": "4.29",
+            "priceCurrency": "USD",
+            "availability": "https://schema.org/InStock",
+        },
+        "weight": "1 gal",
+    }
+
+    async def fake_extract_jsonld(_page):
+        return [raw_jsonld]
+
+    async def fake_visible_facts(_page):
+        return {
+            "ppm": "",
+            "volume_description": "",
+            "digital_description": "",
+            "volume_price": "",
+            "digital_price": "",
+            "regular_price": "4.29",
+            "sale_price": "",
+        }
+
+    monkeypatch.setattr(scraper, "extract_jsonld", fake_extract_jsonld)
+    monkeypatch.setattr(scraper, "visible_product_facts", fake_visible_facts)
+
+    browser = FakeBrowser(page)
+    loc = {
+        "zipcode": "60061",
+        "store_name": "Mariano's",
+        "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061",
+        "store_id": "53100502",
+    }
+
+    result = run(scraper.parse_product_page(
+        browser,
+        "https://www.marianos.com/p/simple-truth-organic-whole-milk/0001111085303",
+        {"category": "Dairy", "sub_category": "Milk"},
+        loc,
+        "2026-10-31",
+        10000,
+    ))
+
+    assert result["status"] == "success"
+    rec = result["record"]
+    assert list(rec.keys()) == FIELDS
+    assert rec["store_name"] == "Mariano's"
+    assert rec["store_location"] == "1720 N Milwaukee Ave, Vernon Hills, IL 60061"
+    assert rec["zipcode"] == "60061"
+    assert rec["store_brand"] == "yes"  # Simple Truth is private label
+    assert rec["category"] == "Dairy"
+    assert rec["sub_category"] == "Milk"
+    assert rec["product_title"] == "Simple Truth Organic Whole Milk"
+    assert rec["weight"] == "1 gal"
+    assert rec["regular_price"] == "4.29"
+    assert rec["sale_price"] == ""
+    assert rec["upc"] == "0001111085303"
+    assert rec["gupc"] == ""
+    assert rec["unit_price"] == ""
+    assert rec["ppm"] == ""
+    assert rec["crawl_date"] == "2026-10-31"
+
+
+def test_product_parser_honeycrisp_apples_representative(monkeypatch):
+    """Representative source response test: Honeycrisp Apples national brand / produce."""
+    page = FakePage()
+    raw_jsonld = {
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": "Honeycrisp Apples Bag",
+        "image": "https://www.marianos.com/product/images/xlarge/front/0000000004128",
+        "gtin12": "0000000004128",
+        "weight": "3 lb",
+        "offers": {"price": "5.99"},
+    }
+
+    async def fake_extract_jsonld(_page):
+        return [raw_jsonld]
+
+    async def fake_visible_facts(_page):
+        return {
+            "ppm": "",
+            "volume_description": "",
+            "digital_description": "",
+            "volume_price": "",
+            "digital_price": "",
+            "regular_price": "5.99",
+            "sale_price": "",
+        }
+
+    monkeypatch.setattr(scraper, "extract_jsonld", fake_extract_jsonld)
+    monkeypatch.setattr(scraper, "visible_product_facts", fake_visible_facts)
+
+    browser = FakeBrowser(page)
+    loc = {"zipcode": "60061", "store_name": "Mariano's", "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061"}
+
+    result = run(scraper.parse_product_page(
+        browser,
+        "https://www.marianos.com/p/honeycrisp-apples/0000000004128",
+        {"category": "Produce", "sub_category": "Apples"},
+        loc,
+        "2026-10-31",
+        10000,
+    ))
+
+    assert result["status"] == "success"
+    rec = result["record"]
+    assert rec["store_brand"] == "no"
+    assert rec["product_title"] == "Honeycrisp Apples Bag"
+    assert rec["weight"] == "3 lb"
+    assert rec["regular_price"] == "5.99"
+    assert rec["upc"] == "0000000004128"
+
+
+def test_product_parser_excludes_approximate_weight_in_weight_field(monkeypatch):
+    page = FakePage()
+    raw_jsonld = {
+        "@type": "Product",
+        "name": "Private Selection USDA Choice Angus Beef Ribeye Steak",
+        "weight": "approximately 1.25 lb",
+        "gtin12": "0020123400000",
+    }
+
+    async def fake_extract_jsonld(_page):
+        return [raw_jsonld]
+
+    async def fake_visible_facts(_page):
+        return {"ppm": "", "volume_description": "", "digital_description": "", "volume_price": "", "digital_price": "", "regular_price": "14.99", "sale_price": ""}
+
+    monkeypatch.setattr(scraper, "extract_jsonld", fake_extract_jsonld)
+    monkeypatch.setattr(scraper, "visible_product_facts", fake_visible_facts)
+
+    browser = FakeBrowser(page)
+    loc = {"zipcode": "60061", "store_name": "Mariano's", "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061"}
+
+    result = run(scraper.parse_product_page(
+        browser,
+        "https://www.marianos.com/p/ribeye/0020123400000",
+        {"category": "Meat", "sub_category": "Beef"},
+        loc,
+        "2026-10-31",
+        10000,
+    ))
+
+    assert result["status"] == "excluded_approx_weight"
+    assert result["record"] is None
+
+
+def test_product_parser_captures_both_regular_and_sale_and_deals(monkeypatch):
+    page = FakePage()
+    raw_jsonld = {
+        "@type": "Product",
+        "name": "Tide Liquid Laundry Detergent",
+        "image": "https://www.marianos.com/p/images/tide.jpg",
+        "gtin12": "0003700012345",
+        "weight": "92 fl oz",
+    }
+
+    async def fake_extract_jsonld(_page):
+        return [raw_jsonld]
+
+    async def fake_visible_facts(_page):
+        return {
+            "ppm": "",
+            "volume_description": "Buy 2 Save $5 on household items",
+            "digital_description": "Save $2.00 with digital coupon",
+            "volume_price": "5.00",
+            "digital_price": "2.00",
+            "regular_price": "12.99",
+            "sale_price": "9.99",
+        }
+
+    monkeypatch.setattr(scraper, "extract_jsonld", fake_extract_jsonld)
+    monkeypatch.setattr(scraper, "visible_product_facts", fake_visible_facts)
+
+    browser = FakeBrowser(page)
+    loc = {"zipcode": "60061", "store_name": "Mariano's", "store_location": "1720 N Milwaukee Ave, Vernon Hills, IL 60061"}
+
+    result = run(scraper.parse_product_page(
+        browser,
+        "https://www.marianos.com/p/tide/0003700012345",
+        {"category": "Household", "sub_category": "Laundry"},
+        loc,
+        "2026-10-31",
+        10000,
+    ))
+
+    assert result["status"] == "success"
+    rec = result["record"]
+    assert rec["regular_price"] == "12.99"
+    assert rec["sale_price"] == "9.99"
+    assert rec["volume_deals_description"] == "Buy 2 Save $5 on household items"
+    assert rec["volume_deals_price"] == "5.00"
+    assert rec["digital_deals_description"] == "Save $2.00 with digital coupon"
+    assert rec["digital_deals_price"] == "2.00"
