@@ -4,6 +4,10 @@ __pycache__/
 *.pyc
 logs/*.log
 data/*.json
+data/*.csv
+data/checkpoints/
+data/evidence/
+data/*_diag_test/
 !data/.gitkeep
 
 config/settings.json

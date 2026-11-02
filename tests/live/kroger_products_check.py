@@ -1,15 +1,19 @@
 
 import os
+from dotenv import load_dotenv
 import requests
 from requests.auth import HTTPBasicAuth
+
+load_dotenv()
 
 BASE = "https://api.kroger.com/v1"
 
 client_id = os.getenv("KROGER_CLIENT_ID")
 client_secret = os.getenv("KROGER_CLIENT_SECRET")
+target_zip = os.getenv("KROGER_ZIP", "60061")
 
 if not client_id or not client_secret:
-    raise SystemExit("Missing Kroger credentials in this PowerShell session.")
+    raise SystemExit("Missing Kroger credentials in this session.")
 
 # Get an access token
 auth_response = requests.post(
@@ -31,12 +35,12 @@ headers = {
     "Accept": "application/json",
 }
 
-# Search for Mariano's locations near ZIP 60601
+# Search for Mariano's locations near target ZIP
 location_response = requests.get(
     f"{BASE}/locations",
     headers=headers,
     params={
-        "filter.zipCode.near": "60601",
+        "filter.zipCode.near": target_zip,
         "filter.limit": 50,
     },
     timeout=30,

@@ -1,7 +1,10 @@
 
 import os
+from dotenv import load_dotenv
 import requests
 from requests.auth import HTTPBasicAuth
+
+load_dotenv()
 
 client_id = os.getenv("KROGER_CLIENT_ID")
 client_secret = os.getenv("KROGER_CLIENT_SECRET")

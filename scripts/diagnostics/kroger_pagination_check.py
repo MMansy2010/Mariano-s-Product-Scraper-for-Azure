@@ -1,18 +1,23 @@
 
 import os
 import time
+from dotenv import load_dotenv
 import requests
 from requests.auth import HTTPBasicAuth
 
+load_dotenv()
+
 BASE = "https://api.kroger.com/v1"
-STORE_ID = "53100503"
+STORE_ID = os.getenv("KROGER_STORE_ID", "53100502")
+
+client_id = os.getenv("KROGER_CLIENT_ID")
+client_secret = os.getenv("KROGER_CLIENT_SECRET")
+if not client_id or not client_secret:
+    raise SystemExit("Missing Kroger credentials in this session.")
 
 auth = requests.post(
     f"{BASE}/connect/oauth2/token",
-    auth=HTTPBasicAuth(
-        os.environ["KROGER_CLIENT_ID"],
-        os.environ["KROGER_CLIENT_SECRET"],
-    ),
+    auth=HTTPBasicAuth(client_id, client_secret),
     headers={"Content-Type": "application/x-www-form-urlencoded"},
     data={
         "grant_type": "client_credentials",
